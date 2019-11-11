@@ -52,9 +52,11 @@ const char
     * const GridBase::META_FILE_BBOX_MIN = "file_bbox_min",
     * const GridBase::META_FILE_BBOX_MAX = "file_bbox_max",
     * const GridBase::META_FILE_COMPRESSION = "file_compression",
+    * const GridBase::META_FILE_DELAYED_LOAD = "file_delayed_load",
     * const GridBase::META_FILE_MEM_BYTES = "file_mem_bytes",
-    * const GridBase::META_FILE_VOXEL_COUNT = "file_voxel_count",
-    * const GridBase::META_FILE_DELAYED_LOAD = "file_delayed_load";
+    * const GridBase::META_FILE_VALUE_MIN = "file_value_min",
+    * const GridBase::META_FILE_VALUE_MAX = "file_value_max",
+    * const GridBase::META_FILE_VOXEL_COUNT = "file_voxel_count";
 
 
 ////////////////////////////////////////
@@ -437,6 +439,8 @@ GridBase::addStatsMetadata()
     this->removeMeta(META_FILE_BBOX_MIN);
     this->removeMeta(META_FILE_BBOX_MAX);
     this->removeMeta(META_FILE_MEM_BYTES);
+    this->removeMeta(META_FILE_VALUE_MIN);
+    this->removeMeta(META_FILE_VALUE_MAX);
     this->removeMeta(META_FILE_VOXEL_COUNT);
     this->insertMeta(META_FILE_BBOX_MIN,    Vec3IMetadata(bbox.min().asVec3i()));
     this->insertMeta(META_FILE_BBOX_MAX,    Vec3IMetadata(bbox.max().asVec3i()));
@@ -448,19 +452,18 @@ GridBase::addStatsMetadata()
 MetaMap::Ptr
 GridBase::getStatsMetadata() const
 {
-    const char* const fields[] = {
+    /// @todo Check that the fields are of the correct type?
+    MetaMap::Ptr ret(new MetaMap);
+    for (const char* const field: {
         META_FILE_BBOX_MIN,
         META_FILE_BBOX_MAX,
         META_FILE_MEM_BYTES,
+        META_FILE_VALUE_MIN,
+        META_FILE_VALUE_MAX,
         META_FILE_VOXEL_COUNT,
-        nullptr
-    };
-
-    /// @todo Check that the fields are of the correct type?
-    MetaMap::Ptr ret(new MetaMap);
-    for (int i = 0; fields[i] != nullptr; ++i) {
-        if (Metadata::ConstPtr m = (*this)[fields[i]]) {
-            ret->insertMeta(fields[i], *m);
+    }) {
+        if (Metadata::ConstPtr m = (*this)[field]) {
+            ret->insertMeta(field, *m);
         }
     }
     return ret;

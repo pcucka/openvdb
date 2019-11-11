@@ -37,6 +37,7 @@
 #include "io/io.h"
 #include "math/Transform.h"
 #include "tree/Tree.h"
+#include "tree/NodeManager.h"
 #include "util/logging.h"
 #include "util/Name.h"
 #include <cassert>
@@ -366,9 +367,11 @@ public:
     static const char* const META_FILE_BBOX_MIN;
     static const char* const META_FILE_BBOX_MAX;
     static const char* const META_FILE_COMPRESSION;
-    static const char* const META_FILE_MEM_BYTES;
-    static const char* const META_FILE_VOXEL_COUNT;
     static const char* const META_FILE_DELAYED_LOAD;
+    static const char* const META_FILE_MEM_BYTES;
+    static const char* const META_FILE_VALUE_MIN;
+    static const char* const META_FILE_VALUE_MAX;
+    static const char* const META_FILE_VOXEL_COUNT;
 
 
     /// @name Statistics
@@ -391,7 +394,7 @@ public:
     /// of statistics like the active voxel count and bounding box.
     /// @note This metadata is not automatically kept up-to-date with
     /// changes to this grid.
-    void addStatsMetadata();
+    virtual void addStatsMetadata();
     /// @brief Return a new MetaMap containing just the metadata that
     /// was added to this grid with @vdblink::GridBase::addStatsMetadata()
     /// addStatsMetadata@endlink.
@@ -856,6 +859,12 @@ public:
     /// Return the number of bytes of memory used by this grid.
     /// @todo Add transform().memUsage()
     Index64 memUsage() const override { return tree().memUsage(); }
+
+    /// @brief Add metadata to this grid comprising the current values
+    /// of statistics like the active voxel count and bounding box.
+    /// @note This metadata is not automatically kept up-to-date with
+    /// changes to this grid.
+    void addStatsMetadata() override;
 
     /// @}
 
@@ -1478,6 +1487,147 @@ Grid<TreeT>::evalActiveVoxelDim() const
     Coord dim;
     const bool nonempty = tree().evalActiveVoxelDim(dim);
     return (nonempty ? dim : Coord());
+}
+
+
+////////////////////////////////////////
+
+
+#define OPENVDB_ADD_VALUE_MIN_MAX_STATS_METADATA
+
+namespace internal {
+
+// Functor for use with tree::NodeManager::reduceTopDown() to compute
+// the statistics that are stored by addStatsMetadata()
+template<typename TreeT>
+struct GridStatsOp
+{
+    using ValueT = typename TreeT::ValueType;
+
+    GridStatsOp(const TreeT& tree)
+        // Record the first active value, if there is one,
+        // and initialize minVal and maxVal with that value.
+        : startVal(tree.cbeginValueOn() ? *tree.cbeginValueOn() : zeroVal<ValueT>())
+        , minVal(startVal)
+        , maxVal(startVal)
+    {
+    }
+
+    GridStatsOp(const GridStatsOp& other, tbb::split)
+        : startVal(other.startVal)
+        , minVal(startVal)
+        , maxVal(startVal)
+    {
+    }
+
+    void join(const GridStatsOp& other)
+    {
+        bbox.expand(other.bbox);
+        memBytes += other.memBytes;
+        voxelCount += other.voxelCount;
+        minVal = std::min(minVal, other.minVal);
+        maxVal = std::max(maxVal, other.maxVal);
+    }
+
+    void operator()(const typename TreeT::RootNodeType& node)
+    {
+        using NodeT = typename TreeT::RootNodeType;
+        using ChildT = typename NodeT::ChildNodeType;
+        using IterT = typename NodeT::ValueOnCIter::BaseT::MapIterT;
+
+        memBytes += sizeof(node) + (node.getTableSize() * sizeof(typename IterT::value_type));
+
+        for (auto it = node.cbeginValueOn(); it; ++it) {
+            bbox.expand(it.getCoord(), ChildT::DIM);
+            voxelCount += ChildT::NUM_VALUES;
+#ifdef OPENVDB_ADD_VALUE_MIN_MAX_STATS_METADATA
+            const auto& val = *it;
+            minVal = std::min(minVal, val);
+            maxVal = std::max(maxVal, val);
+#endif
+        }
+    }
+
+    template<typename NodeT>
+    void operator()(const NodeT& node)
+    {
+        using ChildT = typename NodeT::ChildNodeType;
+
+        memBytes += NodeT::NUM_VALUES * sizeof(typename NodeT::UnionType) + sizeof(Coord)
+            + node.getChildMask().memUsage() + node.getValueMask().memUsage();
+
+        for (auto it = node.cbeginValueOn(); it; ++it) {
+            bbox.expand(it.getCoord(), ChildT::DIM);
+            voxelCount += ChildT::NUM_VALUES;
+#ifdef OPENVDB_ADD_VALUE_MIN_MAX_STATS_METADATA
+            const auto& val = *it;
+            minVal = std::min(minVal, val);
+            maxVal = std::max(maxVal, val);
+#endif
+        }
+    }
+
+    void operator()(const typename TreeT::LeafNodeType& node)
+    {
+        memBytes += node.memUsage();
+        const auto& mask = node.getValueMask();
+        for (auto it = mask.beginOn(); it; ++it) {
+            ++voxelCount;
+            const auto pos = it.pos();
+            bbox.expand(node.offsetToGlobalCoord(pos));
+#ifdef OPENVDB_ADD_VALUE_MIN_MAX_STATS_METADATA
+            const auto& val = node.getValue(pos);
+            minVal = std::min(minVal, val);
+            maxVal = std::max(maxVal, val);
+#endif
+        }
+    }
+
+    CoordBBox bbox;
+    openvdb::Index64 memBytes = 0;
+    openvdb::Index64 voxelCount = 0;
+    // The splitting constructor cannot safely access members such as minVal and maxVal,
+    // since another thread might be modifying them; hence this const member.
+    const ValueT startVal;
+    ValueT minVal, maxVal;
+}; // struct GridStatsOp
+
+} // namespace internal
+
+
+template<typename TreeT>
+inline void
+Grid<TreeT>::addStatsMetadata()
+{
+    tree::NodeManager<TreeT> nodes(tree());
+    internal::GridStatsOp<TreeT> op(tree());
+    nodes.reduceTopDown(op);
+
+    this->removeMeta(META_FILE_BBOX_MIN);
+    this->removeMeta(META_FILE_BBOX_MAX);
+    this->removeMeta(META_FILE_MEM_BYTES);
+    this->removeMeta(META_FILE_VALUE_MIN);
+    this->removeMeta(META_FILE_VALUE_MAX);
+    this->removeMeta(META_FILE_VOXEL_COUNT);
+
+    this->insertMeta(META_FILE_BBOX_MIN,    Vec3IMetadata(op.bbox.min().asVec3i()));
+    this->insertMeta(META_FILE_BBOX_MAX,    Vec3IMetadata(op.bbox.max().asVec3i()));
+    this->insertMeta(META_FILE_MEM_BYTES,   Int64Metadata(op.memBytes));
+    this->insertMeta(META_FILE_VOXEL_COUNT, Int64Metadata(op.voxelCount));
+
+#ifdef OPENVDB_ADD_VALUE_MIN_MAX_STATS_METADATA
+    if (Metadata::isRegisteredType(valueType())) {
+        using MetadataT = TypedMetadata<ValueType>;
+        auto valMeta = Metadata::createMetadata(valueType());
+        if (valMeta && (valMeta->typeName() == MetadataT::staticTypeName())) {
+            MetadataT* valPtr = static_cast<MetadataT*>(valMeta.get());
+            valPtr->value() = op.minVal;
+            this->insertMeta(META_FILE_VALUE_MIN, *valMeta);
+            valPtr->value() = op.maxVal;
+            this->insertMeta(META_FILE_VALUE_MAX, *valMeta);
+        }
+    }
+#endif
 }
 
 
