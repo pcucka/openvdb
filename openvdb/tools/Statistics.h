@@ -40,6 +40,7 @@
 #include <openvdb/Exceptions.h>
 #include <openvdb/math/Stats.h>
 #include "ValueTransformer.h"
+#include <vector>
 
 
 namespace openvdb {
@@ -218,6 +219,46 @@ opStatistics(const IterT& iter, const OperatorT& op = OperatorT(), bool threaded
 template<typename OperatorT, typename IterT>
 inline math::Extrema
 opExtrema(const IterT& iter, const OperatorT& op = OperatorT(), bool threaded = true);
+
+
+/// @brief Iterate over a scalar grid and compute its index-space center of mass.
+template<typename IterT>
+inline Vec3d
+centroid(const IterT& iter, bool threaded = true);
+
+/// @brief Iterate over a scalar grid and compute its world-space center of mass.
+template<typename IterT>
+inline Vec3d
+centroid(const IterT& iter, const math::Transform& indexToWorld, bool threaded = true);
+
+/// @brief Iterate over a scalar grid and compute its index-space second-order moments.
+/// @return the matrix of second-order raw moments or, if @a centroid is nonzero,
+/// the matrix of second-order central moments
+template<typename IterT>
+inline Mat3d
+moments(const IterT& iter, const Vec3d& centroid = Vec3d(0), bool threaded = true);
+
+/// @brief Iterate over a scalar grid and compute its world-space second-order moments.
+/// @return the matrix of second-order raw moments or, if @a centroid is nonzero,
+/// the matrix of second-order central moments
+template<typename IterT>
+inline Mat3d
+moments(
+    const IterT& iter,
+    const math::Transform& indexToWorld,
+    const Vec3d& centroid = Vec3d(0),
+    bool threaded = true);
+
+/// @brief Return the given grid's world-space center of mass as well as
+/// three vectors in the directions of its principal axes.
+/// @details The axes are returned in order of decreasing magnitude,
+/// with the relative magnitudes given by the eigenvalues of the matrix
+/// of second-order central moments of the grid's interior voxels.
+/// @return an empty list if a solution could not be found
+template<typename GridT>
+inline std::vector<Vec3d>
+principalAxes(const GridT& grid);
+
 
 ////////////////////////////////////////
 
@@ -425,6 +466,240 @@ opStatistics(const IterT& iter, const OperatorT& op, bool threaded)
     stats_internal::MathOp<IterT, OperatorT, math::Stats> func(iter, op);
     tools::accumulate(iter, func, threaded);
     return func.mStats;
+}
+
+
+namespace stats_internal {
+
+struct IndexSpaceValueOp
+{
+    template<typename IterT>
+    void operator()(const IterT& iter, Vec3d& xyz, double& value) const
+    {
+        xyz = iter.getCoord().asVec3d();
+        //value = static_cast<double>(*iter); /// < @todo if fog volume
+        value = 1.0;
+    }
+};
+
+struct WorldSpaceValueOp
+{
+    const math::Transform xform;
+
+    WorldSpaceValueOp(const math::Transform& xform_): xform(xform_) {}
+
+    template<typename IterT>
+    void operator()(const IterT& iter, Vec3d& xyz, double& value) const
+    {
+        xyz = xform.indexToWorld(iter.getCoord());
+        //value = static_cast<double>(*iter); /// < @todo if fog volume
+        value = 1.0;
+    }
+};
+
+
+template<typename ValueOp>
+struct CentroidOp
+{
+    double m000 = 0.0;
+    Vec3d ctr = Vec3d(0, 0, 0);
+    const ValueOp valueOp;
+
+    CentroidOp(const ValueOp& op): valueOp(op) {}
+
+    double area() const { return m000; }
+    Vec3d centroid() const { return (m000 > 0.0 ? (ctr / m000) : Vec3d(0, 0, 0)); }
+
+    template<typename IterT>
+    void operator()(const IterT& iter)
+    {
+        //using ValueT = typename IterTraits<IterT>::ValueType;
+        //using Getter = GetValImpl<ValueT, VecTraits<ValueT>::IsVec>;
+        //const auto val = GetterT::get(*iter);
+        //const double val = 1.0;
+        //m000 += val;
+        //ctr += xform.indexToWorld(iter.getCoord()) * val;
+
+        /// @todo if (iter.isVoxelValue()) ...
+        Vec3d xyz;
+        double val;
+        valueOp(iter, xyz, val);
+        m000 += val;
+        ctr += xyz * val;
+    }
+
+    void join(const CentroidOp& other) { m000 += other.m000; ctr += other.ctr; }
+}; // struct CentroidOp
+
+
+template<typename ValueOp>
+inline CentroidOp<ValueOp>
+makeCentroidOp(const ValueOp& op) { return CentroidOp<ValueOp>(op); }
+
+
+// Compute second-order central moments
+template<typename ValueOp>
+struct MomentOp
+{
+    const ValueOp valueOp;
+    const Vec3d centroid;
+    double mu200 = 0.0, mu020 = 0.0, mu002 = 0.0;
+    double mu110 = 0.0, mu101 = 0.0, mu011 = 0.0;
+
+    MomentOp(const ValueOp& op, const Vec3d& ctr = Vec3d(0)): valueOp(op), centroid(ctr) {}
+
+    template<typename IterT>
+    void operator()(const IterT& iter)
+    {
+        //using ValueT = typename IterTraits<IterT>::ValueType;
+        //using Getter = GetValImpl<ValueT, VecTraits<ValueT>::IsVec>;
+        /// @todo if (iter.isVoxelValue()) ...
+        Vec3d xyz;
+        double val;
+        valueOp(iter, xyz, val);
+        xyz -= centroid;
+        mu200 += xyz[0] * xyz[0] * val;
+        mu020 += xyz[1] * xyz[1] * val;
+        mu002 += xyz[2] * xyz[2] * val;
+        mu110 += xyz[0] * xyz[1] * val;
+        mu101 += xyz[0] * xyz[2] * val;
+        mu011 += xyz[1] * xyz[2] * val;
+    }
+
+    void join(const MomentOp& other)
+    {
+        if (other.centroid.eq(centroid)) {
+            mu200 += other.mu200;
+            mu020 += other.mu020;
+            mu002 += other.mu002;
+            mu110 += other.mu110;
+            mu101 += other.mu101;
+            mu011 += other.mu011;
+        }
+    }
+}; // struct MomentOp
+
+
+template<typename ValueOp>
+inline MomentOp<ValueOp>
+makeMomentOp(const ValueOp& op, const Vec3d& centroid = Vec3d(0))
+{
+    return MomentOp<ValueOp>{op, centroid};
+}
+
+} // namespace stats_internal
+
+
+/// @brief Iterate over a scalar grid and compute its index-space center of mass.
+template<typename IterT>
+inline Vec3d
+centroid(const IterT& iter, bool threaded)
+{
+    auto op = stats_internal::makeCentroidOp(stats_internal::IndexSpaceValueOp{});
+    tools::accumulate(iter, op, threaded);
+    return op.centroid();
+}
+
+
+/// @brief Iterate over a scalar grid and compute its world-space center of mass.
+template<typename IterT>
+inline Vec3d
+centroid(const IterT& iter, const math::Transform& indexToWorld, bool threaded)
+{
+    auto op = stats_internal::makeCentroidOp(stats_internal::WorldSpaceValueOp{indexToWorld});
+    tools::accumulate(iter, op, threaded);
+    return op.centroid();
+}
+
+
+/// @brief Iterate over a scalar grid and compute its index-space second-order moments.
+/// @return the matrix of second-order raw moments or, if @a centroid is nonzero,
+/// the matrix of second-order central moments
+template<typename IterT>
+inline Mat3d
+moments(const IterT& iter, const Vec3d& centroid, bool threaded)
+{
+    /// @todo
+    /// - 0th-, 1st- and 2nd-order moments
+    /// - for level sets, use interior mask or iterate over all values <= 0
+    /// - for fog volumes, weight by density
+
+    auto op = stats_internal::makeMomentOp(stats_internal::IndexSpaceValueOp{}, centroid);
+    tools::accumulate(iter, op, threaded);
+
+    return Mat3d{
+        op.mu200, op.mu110, op.mu101,
+        op.mu110, op.mu020, op.mu011,
+        op.mu101, op.mu011, op.mu002
+    };
+}
+
+
+/// @brief Iterate over a scalar grid and compute its world-space second-order moments.
+/// @return the matrix of second-order raw moments or, if @a centroid is nonzero,
+/// the matrix of second-order central moments
+template<typename IterT>
+inline Mat3d
+moments(const IterT& iter, const math::Transform& xform, const Vec3d& centroid, bool threaded)
+{
+    /// @todo
+    /// - 0th-, 1st- and 2nd-order moments
+    /// - for level sets, use interior mask or iterate over all values <= 0
+    /// - for fog volumes, weight by density
+
+    auto op = stats_internal::makeMomentOp(stats_internal::WorldSpaceValueOp{xform}, centroid);
+    tools::accumulate(iter, op, threaded);
+
+    return Mat3d{
+        op.mu200, op.mu110, op.mu101,
+        op.mu110, op.mu020, op.mu011,
+        op.mu101, op.mu011, op.mu002
+    };
+}
+
+
+/// @brief Return the given grid's world-space center of mass as well as
+/// three vectors in the directions of its principal axes.
+/// @details The axes are returned in order of decreasing magnitude,
+/// with the relative magnitudes given by the eigenvalues of the matrix
+/// of second-order central moments of the grid's interior voxels.
+/// @return an empty list if a solution could not be found
+template<typename GridT>
+inline std::vector<Vec3d>
+principalAxes(const GridT& grid)
+{
+    /// @todo
+    /// - for level sets, use interior mask or iterate over all values <= 0
+    /// - for fog volumes, weight by density
+
+    // Compute the world-space center of mass.
+    const auto ctr = centroid(grid.cbeginValueOn(), grid.transform());
+
+    // Compute world-space second-order central moments.
+    const auto mu = moments(grid.cbeginValueOn(), grid.transform(), ctr);
+
+    // Compute the eigensystem of the matrix of second-order central moments.
+    Mat3d eigenvectors;
+    Vec3d eigenvalues{0.0};
+    if (!math::diagonalizeSymmetricMatrix(mu, eigenvectors, eigenvalues)) {
+        OPENVDB_LOG_DEBUG("failed to diagonalize matrix of second-order central moments");
+        return std::vector<Vec3d>{};
+    }
+
+    // Order eigenvalues from largest to smallest.
+    const int
+        maxIdx = int(openvdb::math::MaxIndex(eigenvalues)),
+        minIdx = int(openvdb::math::MinIndex(eigenvalues)),
+        midIdx = ~(maxIdx | minIdx) & 0x3;
+
+    std::vector<Vec3d> axes;
+    axes.push_back(ctr);
+    // The eigenvector associated with the largest eigenvalue
+    // indicates the direction of the principal axis.
+    axes.push_back(eigenvectors.col(maxIdx).unit() * eigenvalues[maxIdx]);
+    axes.push_back(eigenvectors.col(midIdx).unit() * eigenvalues[midIdx]);
+    axes.push_back(eigenvectors.col(minIdx).unit() * eigenvalues[minIdx]);
+    return axes;
 }
 
 } // namespace tools

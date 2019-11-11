@@ -50,6 +50,7 @@ public:
     CPPUNIT_TEST(testGridStats);
     CPPUNIT_TEST(testGridHistogram);
     CPPUNIT_TEST(testGridOperatorStats);
+    CPPUNIT_TEST(testPrincipalAxes);
     CPPUNIT_TEST_SUITE_END();
 
     void testMinMax();
@@ -60,6 +61,7 @@ public:
     void testGridStats();
     void testGridHistogram();
     void testGridOperatorStats();
+    void testPrincipalAxes();
 };
 
 CPPUNIT_TEST_SUITE_REGISTRATION(TestStats);
@@ -778,6 +780,70 @@ TestStats::testGridHistogram()
                     CPPUNIT_ASSERT_EQUAL(uint64_t(0), hist.count(i));
                 }
             }
+        }
+    }
+}
+
+
+void
+TestStats::testPrincipalAxes()
+{
+    using namespace openvdb;
+
+    for (int axis = 0; axis <= 2; ++axis) {
+        const int kLength = 2048;
+        {
+            CoordBBox bbox{Coord{0, 0, 0}, Coord{0, 0, 0}};
+            bbox.max()[axis] = kLength;
+
+            // Fill a grid with a line of voxels along one axis.
+            FloatGrid grid;
+            grid.fill(bbox, 1.0f);
+
+            const auto axes = tools::principalAxes(grid);
+            CPPUNIT_ASSERT_EQUAL(4, int(axes.size()));
+
+            // The centroid of the grid should lie at the midpoint of the line
+            // in both world space and index space.
+            const auto& centroid = axes[0];
+            Vec3d ctr(0);
+            ctr[axis] = double(kLength >> 1);
+            CPPUNIT_ASSERT(ctr.eq(centroid)); // world space
+            CPPUNIT_ASSERT(ctr.eq(tools::centroid(grid.cbeginValueOn()))); // index space
+
+            // The principal axis should lie in the direction of the line.
+            Vec3d principalAxis(0);
+            principalAxis[axis] = 1.0;
+            CPPUNIT_ASSERT(principalAxis.eq(axes[1].unit()));
+        }
+        {
+            const int axis1 = (axis + 1) % 3;
+
+            CoordBBox bbox{Coord{0, 0, 0}, Coord{0, 0, 0}};
+            bbox.max()[axis] = kLength;
+            bbox.max()[axis1] = kLength >> 1;
+
+            // Fill a grid with an axis-aligned plane of voxels.
+            FloatGrid grid;
+            grid.fill(bbox, 1.0f);
+
+            const auto axes = tools::principalAxes(grid);
+            CPPUNIT_ASSERT_EQUAL(4, int(axes.size()));
+
+            // The centroid of the grid should lie in the plane.
+            const auto& centroid = axes[0];
+            Vec3d ctr(0);
+            ctr[axis] = double(kLength >> 1);
+            ctr[axis1] = double(kLength >> 2);
+            CPPUNIT_ASSERT(ctr.eq(centroid));
+
+            // The principal and secondary axes should lie in the plane of the grid.
+            Vec3d principalAxis(0);
+            principalAxis[axis] = 1.0;
+            CPPUNIT_ASSERT(principalAxis.eq(axes[1].unit()));
+            Vec3d secondaryAxis(0);
+            secondaryAxis[axis1] = 1.0;
+            CPPUNIT_ASSERT(secondaryAxis.eq(axes[2].unit()));
         }
     }
 }
